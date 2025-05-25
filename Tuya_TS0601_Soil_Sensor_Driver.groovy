@@ -13,11 +13,16 @@
  *
  * Confirmed Tuya Data Points (DP_IDs):
  * - DPID 15 (0x0F): Battery Percentage (value: 0-100)
- * - DPID 14 (0x0E): Battery State (enum: 0=low, 1=medium, 2=high) <-- Now displayed
+ * - DPID 14 (0x0E): Battery State (enum: 0=low, 1=medium, 2=high)
+ * - DPID 3 (0x03): Battery Voltage (value: mV)
  * - DPID 9 (0x09): Temperature Scale (0=Celsius, 1=Fahrenheit)
  * - DPID 101 (0x65): Illuminance (in Lux)
  * - DPID 5 (0x05):  Soil Moisture (value: percentage * 100)
  * - DPID 110 (0x6e): Soil Temperature (value: Celsius/Fahrenheit * 10)
+ *
+ * Obsolete/Redundant DPIDs (might appear but are not actively used for events in this driver):
+ * - DPID 113 (0x71): Previously thought to be Soil Moisture
+ * - DPID 112 (0x70): Previously thought to be Soil Temperature
  */
 
 metadata {
@@ -32,6 +37,7 @@ metadata {
         attribute 'healthStatus', 'enum', ['unknown', 'offline', 'online']
         attribute 'soilMoisture', 'number' // Custom attribute for soil moisture
         attribute 'batteryState', 'enum', ['unknown', 'low', 'medium', 'high'] // Custom attribute for battery state
+        attribute 'batteryVoltage', 'number' // NEW: Custom attribute for battery voltage
 
         fingerprint profileId:"0104", endpointId:"01", inClusters:"0004,0005,EF00,0000,ED00", outClusters:"0019,000A", model:"TS0601", manufacturer:"_TZE284_sgabhwa6", controllerType: "ZGB"
     }
@@ -51,7 +57,8 @@ void installed() {
     log.debug "Installing Tuya TS0601 Soil Moisture Sensor..."
     sendEvent(name: "soilMoisture", value: "unknown")
     sendEvent(name: "battery", value: "unknown")
-    sendEvent(name: "batteryState", value: "unknown") // Initialize batteryState
+    sendEvent(name: "batteryState", value: "unknown")
+    sendEvent(name: "batteryVoltage", value: "unknown")
     sendEvent(name: "temperature", value: "unknown")
     sendEvent(name: "illuminance", value: "unknown")
     initializeVars(true) // Initialize variables, including healthStatus
@@ -108,42 +115,46 @@ void parse(String description) {
     setPresent() // Reset health check counter on any incoming data
     def cluster = zigbee.parse(description)
 
-    if (cluster) {
-        log.debug "Parsed cluster: ${cluster}"
-
-        if (cluster.clusterId == 0xEF00 && (cluster.command == 0x01 || cluster.command == 0x02 || cluster.command == 0x05 || cluster.command == 0x06)) {
-            processTuyaEF00Data(cluster.data, cluster.command)
-        } else if (cluster.clusterId == 0x0000 && cluster.command == 0x0A) {
-            // This is a Basic Cluster Report Attributes message (0x0A)
-            parseBasicClusterData(cluster)
-        } else if (cluster.clusterId == 0x0000 && cluster.command == 0x0B) {
-             log.debug "ZCL Default Response: Command: ${cluster.data[0]}, Status: ${cluster.data[1]}"
-        } else {
-            // Robust logging for messages that don't fit specific patterns,
-            // or where attrId/value are part of a raw description string (e.g., "read attr - raw:")
-            String clusterIdHex = (cluster.clusterId instanceof Integer) ? String.format('%04x', cluster.clusterId) : 'N/A'
-            String commandHex = (cluster.command instanceof Integer) ? String.format('%02x', cluster.command) : 'N/A'
-            String attrIdHex = 'N/A'
-            String valueStr = 'N/A'
-
-            // Attempt to extract attrId and value from raw description if present and not directly in cluster map
-            def matchAttr = description =~ /attrId: (\w+)/
-            def matchValue = description =~ /value: (\w+)/
-            if (matchAttr) {
-                attrIdHex = matchAttr[0][1]
-            }
-            if (matchValue) {
-                valueStr = matchValue[0][1]
-            }
-
-            if (attrIdHex != 'N/A' && valueStr != 'N/A') {
-                if (settings.txtEnable) { log.debug "General parsed Zigbee message: Cluster ID: ${clusterIdHex}, Attr ID: ${attrIdHex}, Value: ${valueStr}" }
-            } else {
-                if (settings.txtEnable) { log.debug "Unhandled parsed Zigbee message type. Cluster ID: ${clusterIdHex}, Command: ${commandHex}, Raw Description: ${description}, Parsed Map: ${cluster}" }
-            }
-        }
-    } else {
+    if (!cluster) {
         log.warn "Failed to parse Zigbee description: ${description}"
+        return // Exit early to prevent further errors
+    }
+
+    log.debug "Parsed cluster: ${cluster}"
+
+    if (cluster.clusterId == 0xEF00 && (cluster.command in [0x01, 0x02, 0x05, 0x06])) {
+        processTuyaEF00Data(cluster.data, cluster.command)
+    } else if (cluster.clusterId == 0x0000 && cluster.command == 0x0A) {
+        // This is a Basic Cluster Report Attributes message (0x0A)
+        parseBasicClusterData(cluster)
+    } else if (cluster.clusterId == 0x0000 && cluster.command == 0x0B) {
+         log.debug "ZCL Default Response: Command: ${cluster.data[0]}, Status: ${cluster.data[1]}"
+    } else {
+        // For unhandled messages in the 'else' block, use msgMap from parseDescriptionAsMap for safe parsing.
+        // This handles cases where zigbee.parse() might not expose attrId/value as properties.
+        def msgMap = zigbee.parseDescriptionAsMap(description) // Re-parse into a plain Map for safety
+
+        String clusterIdHex = (msgMap.clusterId instanceof Integer) ? String.format('%04x', msgMap.clusterId) : 'N/A'
+        String commandHex = (msgMap.command instanceof Integer) ? String.format('%02x', msgMap.command) : 'N/A'
+        String attrIdHex = 'N/A'
+        String valueStr = 'N/A'
+
+        // Use get() for safe access to keys that might not exist as properties
+        def parsedAttrId = msgMap.get('attrId')
+        def parsedValue = msgMap.get('value')
+
+        if (parsedAttrId != null) {
+            attrIdHex = (parsedAttrId instanceof Integer) ? String.format('%04x', parsedAttrId) : parsedAttrId.toString()
+        }
+        if (parsedValue != null) {
+            valueStr = parsedValue.toString()
+        }
+
+        if (attrIdHex != 'N/A' || valueStr != 'N/A') { // Log if we found either attrId or value
+            if (settings?.txtEnable) { log.debug "General parsed Zigbee message: Cluster ID: ${clusterIdHex}, Command: ${commandHex}, Attr ID: ${attrIdHex}, Value: ${valueStr}" }
+        } else { // Fallback to logging the full parsed map if nothing specific was found
+            if (settings?.txtEnable) { log.debug "Unhandled parsed Zigbee message type. Cluster ID: ${clusterIdHex}, Command: ${commandHex}, Raw Description: ${description}, Parsed Map: ${msgMap}" }
+        }
     }
 }
 
@@ -179,6 +190,13 @@ private void processTuyaEF00Data(List<Integer> data, int command) {
                 sendEvent(name: "batteryState", value: stateValue, descriptionText: "Battery State is ${stateValue}")
                 if (settings.txtEnable) { log.info "Battery State (DPID 14): ${stateValue} (raw: ${fncmd})" }
                 break
+            case 3: // 0x03 - Battery Voltage (mV)
+                long signedFncmdVoltage = convertUnsignedToSigned(fncmd)
+                // Explicitly cast to BigDecimal to ensure methods are found
+                BigDecimal voltageV = new BigDecimal(signedFncmdVoltage) / new BigDecimal(1000.0)
+                sendEvent(name: "batteryVoltage", value: (voltageV * 100).round() / 100.0, unit: "V", descriptionText: "Battery Voltage is ${((voltageV * 100).round() / 100.0)}V")
+                if (settings.txtEnable) { log.info "Battery Voltage (DPID 3): ${((voltageV * 100).round() / 100.0)}V (raw: ${fncmd})" }
+                break
             case 9: // 0x09 - Temperature Scale (0=C, 1=F)
                 def scaleUnit = (fncmd == 1) ? "F" : "C"
                 device.updateDataValue("temperatureUnit", scaleUnit) // Stores the preferred unit on the device data
@@ -190,32 +208,29 @@ private void processTuyaEF00Data(List<Integer> data, int command) {
                 break
             case 5:    // 0x05 - Soil Moisture
                 long signedFncmdMoisture = convertUnsignedToSigned(fncmd)
-                def moisturePercent = signedFncmdMoisture / 100.0
-                def finalMoisture = (moisturePercent + safeToDouble(settings?.humidityOffset)).round(1)
+                def moisturePercent = new BigDecimal(signedFncmdMoisture) / new BigDecimal(100.0)
+                def finalMoisture = ((moisturePercent + safeToDouble(settings?.humidityOffset)) * 10).round() / 10.0
                 sendEvent(name: "soilMoisture", value: finalMoisture, unit: "%", descriptionText: "Soil Moisture is ${finalMoisture}%")
                 if (settings.txtEnable) { log.info "Soil Moisture (DPID 5): ${finalMoisture}%" }
                 break
             case 110:  // 0x6e - Soil Temperature
                  long signedFncmdTemp = convertUnsignedToSigned(fncmd)
-                 def temperature = signedFncmdTemp / 10.0;
+                 def temperature = new BigDecimal(signedFncmdTemp) / new BigDecimal(10.0);
                  def tempUnit = device.getDataValue("temperatureUnit") ?: location.temperatureScale
                  if (tempUnit == "C" && location.temperatureScale == "F") {
                      temperature = (temperature * 1.8) + 32
                  } else if (tempUnit == "F" && location.temperatureScale == "C") {
                      temperature = (temperature - 32) / 1.8
                  }
-                 def finalTemperature = (temperature + safeToDouble(settings?.temperatureOffset)).round(1)
+                 def finalTemperature = ((temperature + safeToDouble(settings?.temperatureOffset)) * 10).round() / 10.0
                  sendEvent(name: "temperature", value: finalTemperature, unit: "°${location.temperatureScale}", descriptionText: "Soil Temperature is ${finalTemperature}°${location.temperatureScale}")
                  if (settings.txtEnable) { log.info "Soil Temperature (DPID 110): ${finalTemperature}°${location.temperatureScale}" }
                  break;
-            case 3: // 0x03 - Unknown Data Point, seen with Value: 0.
-                if (settings.txtEnable) { log.debug "DPID 3 (0x03) - Unknown: ${fncmd}" }
-                break;
             case 112: // 0x70 - Previously thought to be Soil Temperature, now logged as obsolete.
             case 113: // 0x71 - Previously thought to be Soil Moisture, now logged as obsolete.
                 if (settings.txtEnable) { log.debug "Obsolete/Redundant Tuya EF00 DP_ID: ${dp}, Raw Value: ${fncmd}. New mapping used." }
                 break
-            default:
+            default: // Other unhandled DPIDs (e.g., 102, 103, 104, 107, 108, 109, 111)
                 if (settings.txtEnable) { log.debug "Unhandled Tuya EF00 DP_ID: ${dp}, Raw Value: ${fncmd}" }
                 break
         }
@@ -226,8 +241,9 @@ private void processTuyaEF00Data(List<Integer> data, int command) {
 // Handles parsing of Basic Cluster (0x0000) attribute reports.
 void parseBasicClusterData(cluster) {
     try {
-        Integer attrId = cluster.attrId instanceof Integer ? cluster.attrId : null
-        Object value = cluster.value
+        // Use get() for safer access to attrId and value
+        Integer attrId = cluster.get('attrId') instanceof Integer ? cluster.get('attrId') : null
+        Object value = cluster.get('value') // Value can be various types
 
         if (attrId == 0x0001 && value != null) { // ZCL Version
             if (settings.txtEnable) { log.info "ZCL Version: ${value}" }
@@ -242,13 +258,14 @@ void parseBasicClusterData(cluster) {
             def batteryRawValue = value as Integer
             if (settings.txtEnable) { log.info "Raw battery value from Basic Cluster (FFE2/FFE4): ${batteryRawValue} (needs interpretation)" }
         } else {
+            // Log with N/A if attrId or value are not present
             if (settings.txtEnable) { log.debug "Unhandled Basic Cluster attribute: Attr ID: ${attrId != null ? String.format('%04x', attrId) : 'N/A'}, Value: ${value}, Raw Map: ${cluster}" }
         }
 
         if (cluster.additionalAttrs) {
             cluster.additionalAttrs.each { attr ->
-                Integer addAttrId = attr.attrId instanceof Integer ? attr.attrId : null
-                Object addAttrValue = attr.value
+                Integer addAttrId = attr.get('attrId') instanceof Integer ? attr.get('attrId') : null // Use get() here too
+                Object addAttrValue = attr.get('value') // Use get() here too
                 if ((addAttrId == 0xFFE2 || addAttrId == 0xFFE4) && addAttrValue != null) {
                     def batteryRawValue = addAttrValue as Integer
                     if (settings.txtEnable) { log.info "Raw battery value from Basic Cluster additionalAttrs (FFE2/FFE4): ${batteryRawValue} (needs interpretation)" }
@@ -338,8 +355,8 @@ void initializeVars(boolean fullInit = true) {
 void scheduleDeviceHealthCheck() {
     // Randomize the minute and hour to spread out hub workload for multiple devices
     Random rnd = new Random()
-    // Schedule using cron format directly with randomized hour/minute
-    schedule("${rnd.nextInt(59)} ${rnd.nextInt(23)} * * ? *", 'deviceHealthCheck')
+    // Schedule using cron format directly with randomized hour/minute (7 fields for Quartz Cron)
+    schedule("0 ${rnd.nextInt(59)} ${rnd.nextInt(24)} * * ? *", 'deviceHealthCheck')
     log.debug "Device health check scheduled."
 }
 
