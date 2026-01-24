@@ -3,7 +3,9 @@
  *
  * Author: George Gilman (ggilman@gmail.com)
  * Date: 2025-05-24
- *
+ * Revised: Michael Rothenberg (Michael@RothenbergIndustries.com)
+ * Updated for Manufacturer	_TZE284_aao3yzhs
+
  * This driver parses data from the specific Tuya TS0601 soil moisture sensor,
  * focusing on interpreting the proprietary Tuya EF00 cluster.
  *
@@ -14,15 +16,16 @@
  * Confirmed Tuya Data Points (DP_IDs):
  * - DPID 15 (0x0F): Battery Percentage (value: 0-100)
  * - DPID 14 (0x0E): Battery State (enum: 0=low, 1=medium, 2=high)
- * - DPID 3 (0x03): Battery Voltage (value: mV)
+ * - DPID 3 (0x05):  Soil Moisture (value: percentage * 100)
  * - DPID 9 (0x09): Temperature Scale (0=Celsius, 1=Fahrenheit)
  * - DPID 101 (0x65): Illuminance (in Lux)
- * - DPID 5 (0x05):  Soil Moisture (value: percentage * 100)
- * - DPID 110 (0x6e): Soil Temperature (value: Celsius/Fahrenheit * 10)
+ * - DPID 5 (0x6e): Soil Temperature (value: Celsius/Fahrenheit * 10)
+ * 
  *
  * Obsolete/Redundant DPIDs (might appear but are not actively used for events in this driver):
  * - DPID 113 (0x71): Previously thought to be Soil Moisture
  * - DPID 112 (0x70): Previously thought to be Soil Temperature
+ * - DPID 110 (0x6e): Soil Temperature (value: Celsius/Fahrenheit * 10)
  */
 
 metadata {
@@ -33,7 +36,6 @@ metadata {
         capability "IlluminanceMeasurement"
         capability "Configuration"
         capability "Health Check"
-
         attribute 'healthStatus', 'enum', ['unknown', 'offline', 'online']
         attribute 'soilMoisture', 'number' // Custom attribute for soil moisture
         attribute 'batteryState', 'enum', ['unknown', 'low', 'medium', 'high'] // Custom attribute for battery state
@@ -182,37 +184,41 @@ private void processTuyaEF00Data(List<Integer> data, int command) {
                 sendEvent(name: "battery", value: (int)fncmd, unit: "%", descriptionText: "Battery is ${(int)fncmd}%")
                 if (settings.txtEnable) { log.info "Battery (DPID 15): ${fncmd}%" }
                 break
-            case 14: // 0x0E - Battery State
+            case 14: // 0x0E - Battery State (0:low, 1:med, 2:high)
                 String stateValue = "unknown"
                 if (fncmd == 0) { stateValue = "low" }
                 else if (fncmd == 1) { stateValue = "medium" }
                 else if (fncmd == 2) { stateValue = "high" }
                 sendEvent(name: "batteryState", value: stateValue, descriptionText: "Battery State is ${stateValue}")
                 if (settings.txtEnable) { log.info "Battery State (DPID 14): ${stateValue} (raw: ${fncmd})" }
-                break
-            case 3: // 0x03 - Battery Voltage (mV)
-                long signedFncmdVoltage = convertUnsignedToSigned(fncmd)
-                // Explicitly cast to BigDecimal to ensure methods are found
-                BigDecimal voltageV = new BigDecimal(signedFncmdVoltage) / new BigDecimal(1000.0)
-                sendEvent(name: "batteryVoltage", value: (voltageV * 100).round() / 100.0, unit: "V", descriptionText: "Battery Voltage is ${((voltageV * 100).round() / 100.0)}V")
-                if (settings.txtEnable) { log.info "Battery Voltage (DPID 3): ${((voltageV * 100).round() / 100.0)}V (raw: ${fncmd})" }
+                break 
+            case 3: // 0x05: Soil Moisture (%)
+                // This model usually reports moisture 1:1 (e.g., 45 = 45%)
+                def finalMoisture = (fncmd.toDouble() + safeToDouble(settings?.humidityOffset)).round(1)
+                sendEvent(name: "soilMoisture", value: finalMoisture, unit: "%") 
+            	if (settings.txtEnable) { log.info "Soil Moisture (DPID 5): ${finalMoisture}%" }
                 break
             case 9: // 0x09 - Temperature Scale (0=C, 1=F)
                 def scaleUnit = (fncmd == 1) ? "F" : "C"
                 device.updateDataValue("temperatureUnit", scaleUnit) // Stores the preferred unit on the device data
                 if (settings.txtEnable) { log.info "Temperature Scale (DPID 9): ${scaleUnit}" }
                 break
+            case 5: // CORRECTED: Temperature
+                // Value is usually Temp * 10 (e.g., 255 = 25.5°C)
+                long signedTemp = convertUnsignedToSigned(fncmd)
+                double tempC = signedTemp / 10.0
+                
+                // Convert to Fahrenheit if hub is set to F
+                double temperature = (location.temperatureScale == "F") ? (tempC * 1.8 + 32) : tempC
+                def finalTemperature = (temperature + safeToDouble(settings?.temperatureOffset)).round(1)
+                
+                sendEvent(name: "temperature", value: finalTemperature, unit: "°${location.temperatureScale}")
+            	if (settings.txtEnable) { log.info "Temperature (DPID 5): ${location.temperatureScale}%" }
+                break
             case 101: // 0x65 - Illuminance (in Lux)
                 sendEvent(name: "illuminance", value: (int)fncmd, unit: "Lux", descriptionText: "Illuminance is ${(int)fncmd} Lux")
                 if (settings.txtEnable) { log.info "Illuminance (DPID 101): ${fncmd} Lux" }
-                break
-            case 5:    // 0x05 - Soil Moisture
-                long signedFncmdMoisture = convertUnsignedToSigned(fncmd)
-                def moisturePercent = new BigDecimal(signedFncmdMoisture) / new BigDecimal(100.0)
-                def finalMoisture = ((moisturePercent + safeToDouble(settings?.humidityOffset)) * 10).round() / 10.0
-                sendEvent(name: "soilMoisture", value: finalMoisture, unit: "%", descriptionText: "Soil Moisture is ${finalMoisture}%")
-                if (settings.txtEnable) { log.info "Soil Moisture (DPID 5): ${finalMoisture}%" }
-                break
+                break 
             case 110:  // 0x6e - Soil Temperature
                  long signedFncmdTemp = convertUnsignedToSigned(fncmd)
                  def temperature = new BigDecimal(signedFncmdTemp) / new BigDecimal(10.0);
@@ -226,6 +232,9 @@ private void processTuyaEF00Data(List<Integer> data, int command) {
                  sendEvent(name: "temperature", value: finalTemperature, unit: "°${location.temperatureScale}", descriptionText: "Soil Temperature is ${finalTemperature}°${location.temperatureScale}")
                  if (settings.txtEnable) { log.info "Soil Temperature (DPID 110): ${finalTemperature}°${location.temperatureScale}" }
                  break;
+            case 111: // Some variants use 111 for Light
+                sendEvent(name: "illuminance", value: (int)fncmd, unit: "lux")
+                break
             case 112: // 0x70 - Previously thought to be Soil Temperature, now logged as obsolete.
             case 113: // 0x71 - Previously thought to be Soil Moisture, now logged as obsolete.
                 if (settings.txtEnable) { log.debug "Obsolete/Redundant Tuya EF00 DP_ID: ${dp}, Raw Value: ${fncmd}. New mapping used." }
